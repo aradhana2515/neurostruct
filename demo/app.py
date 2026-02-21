@@ -1,363 +1,166 @@
 """
-app.py
-======
-Interactive Gradio demo for NeuroStruct.
-
-Features:
-  - Input: protein sequence (or select a known receptor)
-  - ESMFold structure prediction (or load from PDB ID)
-  - GNN binding affinity prediction
-  - 3D structure viewer (py3Dmol) colored by attention weights
-  - Downloadable attention report (JSON)
-  - Residue importance bar chart
+demo/app.py
+Real Gradio demo: loads a trained checkpoint and runs BindingGNN on a PDB ID.
 
 Usage:
-  python demo/app.py
-  # Opens at http://localhost:7860
+  python demo/app.py --checkpoint checkpoints/best_model.pt
+Then open: http://localhost:7860
 """
 
-import sys
+import argparse
 import json
-import time
 import warnings
-import numpy as np
-import torch
 from pathlib import Path
 
-warnings.filterwarnings("ignore")
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
+import numpy as np
+import requests
+import torch
 import gradio as gr
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Example sequences (truncated binding-domain regions for demo speed)
-# ─────────────────────────────────────────────────────────────────────────────
+warnings.filterwarnings("ignore")
 
-EXAMPLE_SEQUENCES = {
-    "GABA-A α1 (extracellular domain)": (
-        "MKVSRLFSLVLNLTRLEDFRSGQTSDWKSDAVPARVPLNLSDRMDSPYQRRLKDNGQVSS"
-        "TDLKLTLSFNMLDRLKIPYNRRSYTVNMFFQLRHWSDKSEYRIRLEQPSSPSLLFNLSYS"
-        "QLKIPQKIVQKIFDKLQMKFQELNQILDKSGSRPVVSYEKTTDNLSLTLGKLSPDFDIQQ"
-        "WIPDNRPASPAQMKIKVADSSFHIDLNKGLPTSGLTYRTTLLFRNYGYTLNLSVEPVHEH"
-    ),
-    "NMDA GluN1 (ligand binding domain)": (
-        "KGSDLSIDDFEQRISQHKQTEKRQRSGSNEGMELEVTAMKKLQQKIIDEDGYDYAHVYGQ"
-        "QPLCPDNLSNITNSHGLRFHAGSIVYISTGKITTIADSQMKRYRLTFESEHLSTSKRKLF"
-        "LGIFATAVQYVAQKHRMPEDGHLPPIKSGFKELLNLIEQNKDIPQRSKLQDLKLHRSIVE"
-        "GFKNEIETANLTLALRVGLQPKNEEVTQTKNTTIRQKTYILNLNVMAKQEMEWYNQMGES"
-    ),
-    "GABA-A β2 (binding interface)": (
-        "MYSFNMELVDAQRHFLNMTLKNMPKNLKDPPNFIITPVKLSSKMRKLSKDYVNSLKSDLT"
-        "FRSLDLQNKTMPIGYLPNIYQNQNRTRSLTNLKFVNYDLMSPTLNSILREGGIGYRRNSS"
-        "NILDNMFADLQSVKQLEHFNDISKNVLPLDTIKALNRKPNQTLDTLPVTYNYYMQMIFSP"
-        "HIQNLQKFMQMDFPKVVMSGYILLNTIIPYITLMKIFHTKLKFNTDNLYAEHKSTLNEFS"
-    ),
-}
+# Allow imports from repo root
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from models.binding_gnn import BindingGNN
+from data import preprocess as pp  # reuse your preprocessing utilities :contentReference[oaicite:8]{index=8}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Mock pipeline (real pipeline requires ESM + trained model weights)
-# ─────────────────────────────────────────────────────────────────────────────
+def download_pdb(pdb_id: str, out_dir: Path) -> Path:
+    pdb_id = pdb_id.strip().lower()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{pdb_id}.pdb"
 
-def run_pipeline_mock(sequence: str, receptor_type: str) -> dict:
+    url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    out_path.write_bytes(r.content)
+    return out_path
+
+
+def graph_from_pdb(pdb_path: Path) -> torch_geometric.data.Data:
     """
-    Demo pipeline that simulates the full prediction without requiring
-    model weights or ESM. Replace with real pipeline after training.
+    Build a PyG Data graph from PDB:
+      - binding site residues if ligand present (fallback: all residues) :contentReference[oaicite:9]{index=9}
+      - contact graph with edge distances :contentReference[oaicite:10]{index=10}
+      - node features: 25-dim biochemical + one-hot AA :contentReference[oaicite:11]{index=11}
     """
-    np.random.seed(hash(sequence[:20]) % (2**31))
+    structure = pp.parse_structure(pdb_path)
+    residues = pp.get_binding_site_residues(structure)  # ligand shell fallback built-in :contentReference[oaicite:12]{index=12}
+    coords, edge_index, edge_dists, valid_res = pp.build_contact_graph(residues)
 
-    L = min(len(sequence), 150)
+    node_features = np.stack([pp.residue_features(r) for r in valid_res]).astype(np.float32)
 
-    # Simulate ESM embedding time
-    time.sleep(0.5)
+    # Build Data WITHOUT y (unknown)
+    from torch_geometric.data import Data
+    data = Data(
+        x=torch.tensor(node_features, dtype=torch.float),
+        edge_index=torch.tensor(edge_index, dtype=torch.long),
+        edge_attr=torch.tensor(edge_dists[:, None], dtype=torch.float),
+        pos=torch.tensor(coords, dtype=torch.float),
+        num_nodes=len(valid_res),
+    )
 
-    # Simulate binding affinity prediction
-    base_dG = {"GABA-A α1 (extracellular domain)": -11.2,
-                "NMDA GluN1 (ligand binding domain)": -9.1,
-                "GABA-A β2 (binding interface)": -8.7}.get(receptor_type, -9.5)
-    pred_dG = base_dG + np.random.normal(0, 0.3)
-    Ki_nM = np.exp(pred_dG / 0.592) * 1e9
+    # Add minimal metadata
+    data.meta = {"pdb_id": pdb_path.stem, "n_residues": len(valid_res)}
+    return data
 
-    # Simulate attention weights (realistic: a few residues dominate)
-    raw_attn = np.random.exponential(0.3, L)
-    attn = raw_attn / raw_attn.sum()
+
+def load_model(checkpoint_path: Path, node_dim: int) -> BindingGNN:
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    args = ckpt.get("args", {})
+    hidden_dim = int(args.get("hidden_dim", 256))
+    num_layers = int(args.get("num_layers", 4))
+    heads = int(args.get("heads", 4))
+    dropout = float(args.get("dropout", 0.15))
+
+    model = BindingGNN(
+        node_dim=node_dim,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        heads=heads,
+        dropout=dropout,
+        edge_dim=1,
+    )
+    model.load_state_dict(ckpt["model_state"])
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def predict(pdb_id: str, checkpoint_path: str):
+    if not pdb_id or len(pdb_id.strip()) < 4:
+        return "⚠️ Enter a valid PDB ID (e.g., 6HUP).", None, None
+
+    ckpt_path = Path(checkpoint_path)
+    if not ckpt_path.exists():
+        return f"⚠️ Checkpoint not found: {ckpt_path}", None, None
+
+    try:
+        pdb_path = download_pdb(pdb_id, out_dir=Path("demo/_pdb_cache"))
+    except Exception as e:
+        return f"⚠️ Failed to download PDB {pdb_id}: {e}", None, None
+
+    try:
+        data = graph_from_pdb(pdb_path)
+    except Exception as e:
+        return f"⚠️ Failed to build graph from PDB: {e}", None, None
+
+    model = load_model(ckpt_path, node_dim=data.x.shape[1])
+
+    pred_dG = float(model(data).item())
+    attn = model.get_attention_weights(data).cpu().numpy()  # sums ~1.0 :contentReference[oaicite:13]{index=13}
 
     # Top residues
     top_idx = np.argsort(attn)[::-1][:10]
-    top_residues = []
-    aa_list = "ACDEFGHIKLMNPQRSTVWY"
-    for rank, idx in enumerate(top_idx, 1):
-        aa = sequence[idx] if idx < len(sequence) else "?"
-        top_residues.append({
-            "rank": rank,
-            "residue": f"{aa}{idx+1}",
-            "importance": f"{attn[idx]:.4f}",
-        })
+    top = [{"rank": i + 1, "res_idx": int(idx + 1), "importance": float(attn[idx])} for i, idx in enumerate(top_idx)]
 
-    return {
-        "predicted_dG":     f"{pred_dG:.2f} kcal/mol",
-        "predicted_Ki":     f"{Ki_nM:.1f} nM" if Ki_nM < 10000 else f"{Ki_nM/1000:.2f} μM",
-        "affinity_class":   "Strong" if pred_dG < -10 else ("Moderate" if pred_dG < -8 else "Weak"),
-        "sequence_length":  L,
-        "n_residues_graph": L,
-        "top_10_residues":  top_residues,
-        "attention_weights": attn.tolist(),
-        "receptor_type":    receptor_type,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Attention plot
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_attention_plot(attn: list, sequence: str):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    attn = np.array(attn)
-    L = len(attn)
-    residues = np.arange(1, L + 1)
-
-    fig, ax = plt.subplots(figsize=(10, 3))
-    fig.patch.set_facecolor("#0f172a")
-    ax.set_facecolor("#0f172a")
-
-    # Color by attention
-    colors = plt.cm.YlOrRd(attn / attn.max())
-    ax.bar(residues, attn, color=colors, width=1.0, edgecolor="none")
-
-    # Highlight top residues
-    top5 = np.argsort(attn)[::-1][:5]
-    for idx in top5:
-        ax.bar(residues[idx], attn[idx], color="#ff4444", width=1.2, edgecolor="none")
-        aa = sequence[idx] if idx < len(sequence) else "?"
-        ax.text(residues[idx], attn[idx] + attn.max() * 0.03,
-                f"{aa}{residues[idx]}", color="white", fontsize=7,
-                ha="center", va="bottom", fontweight="bold")
-
-    ax.set_xlabel("Residue", color="white", fontsize=10)
-    ax.set_ylabel("Attention weight", color="white", fontsize=10)
-    ax.set_title("Binding Site Residue Importance Map", color="white", fontsize=11,
-                 fontweight="bold")
-    ax.tick_params(colors="white")
-    ax.spines[:].set_color("#334155")
-    ax.set_xlim(0, L + 1)
-
-    plt.tight_layout()
-    return fig
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 3D viewer HTML (py3Dmol-style embedded viewer)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def make_3d_viewer_html(pdb_id: str = "6HUP") -> str:
-    """
-    Embed a 3Dmol.js viewer loading a PDB structure from RCSB.
-    In production, load the ESMFold-predicted structure instead.
-    """
-    return f"""
-    <div id="viewer" style="width:100%; height:420px; border-radius:12px; overflow:hidden; background:#1e293b;"></div>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/3Dmol/2.1.0/3Dmol-min.min.js"></script>
-    <script>
-      (function() {{
-        let viewer = $3Dmol.createViewer("viewer", {{backgroundColor: "#1e293b"}});
-        $3Dmol.download("pdb:{pdb_id}", viewer, {{}}, function() {{
-          viewer.setStyle({{}}, {{cartoon: {{color: "spectrum"}}}});
-          // Highlight binding site region (approximate — replace with exact residues)
-          viewer.setStyle(
-            {{resi: "200-260", chain: "A"}},
-            {{cartoon: {{color: "#ff4444"}}, stick: {{colorscheme: "RdYlBu"}}}}
-          );
-          viewer.zoomTo();
-          viewer.render();
-          viewer.zoom(1.1, 1000);
-        }});
-      }})();
-    </script>
-    <p style="color:#94a3b8; font-size:12px; text-align:center; margin-top:6px;">
-      🔴 Highlighted: predicted binding hotspot region  |  PDB: {pdb_id}
-    </p>
-    """
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main prediction function
-# ─────────────────────────────────────────────────────────────────────────────
-
-def predict(sequence: str, receptor_type: str, pdb_id_for_viewer: str):
-    if not sequence or len(sequence) < 20:
-        return (
-            "⚠️ Please enter a sequence of at least 20 amino acids.",
-            None, None, None, None
-        )
-
-    sequence = sequence.upper().replace(" ", "").replace("\n", "")
-    valid_aa = set("ACDEFGHIKLMNPQRSTVWYX")
-    if not all(c in valid_aa for c in sequence):
-        return ("⚠️ Sequence contains invalid characters.", None, None, None, None)
-
-    # Run pipeline
-    result = run_pipeline_mock(sequence, receptor_type)
-
-    # Build summary markdown
-    aff_color = {"Strong": "🟢", "Moderate": "🟡", "Weak": "🔴"}.get(
-        result["affinity_class"], "⚪"
-    )
     summary = f"""
-## Prediction Results
+### Prediction
+- **PDB:** `{pdb_id.upper()}`
+- **Residues in graph:** `{data.num_nodes}`
+- **Predicted ΔG:** `{pred_dG:.3f} kcal/mol`
 
-| Property | Value |
-|---|---|
-| **Predicted ΔG** | `{result['predicted_dG']}` |
-| **Predicted Kᵢ** | `{result['predicted_Ki']}` |
-| **Affinity class** | {aff_color} **{result['affinity_class']}** |
-| **Receptor type** | {result['receptor_type']} |
-| **Residues in graph** | {result['n_residues_graph']} |
+### Top residues (attention pooling)
+{chr(10).join([f"- #{t['rank']}: residue {t['res_idx']}  (importance={t['importance']:.4f})" for t in top])}
+""".strip()
 
-### Top 10 Predicted Binding Residues
-
-| Rank | Residue | Importance |
-|---|---|---|
-{"".join(f"| {r['rank']} | `{r['residue']}` | {r['importance']} |" + chr(10) for r in result['top_10_residues'])}
-
-> **Note:** ΔG < -10 kcal/mol → high-affinity binding (sub-nM). Importance scores are 
-> normalized GAT readout attention weights; they sum to 1.0.
-"""
-
-    # Attention plot
-    attn_plot = make_attention_plot(result["attention_weights"], sequence)
-
-    # 3D viewer HTML
-    viewer_html = make_3d_viewer_html(pdb_id_for_viewer)
-
-    # JSON report
-    report_json = json.dumps({
-        "sequence_length": len(sequence),
-        "receptor_type":   result["receptor_type"],
-        "predicted_dG":    result["predicted_dG"],
-        "predicted_Ki":    result["predicted_Ki"],
-        "top_residues":    result["top_10_residues"],
-    }, indent=2)
-
-    return summary, attn_plot, viewer_html, report_json, gr.update(visible=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UI
-# ─────────────────────────────────────────────────────────────────────────────
-
-CSS = """
-body, .gradio-container { background: #0f172a !important; color: #e2e8f0; }
-.gr-button-primary { background: linear-gradient(135deg, #6366f1, #8b5cf6) !important; }
-.gr-tab-item { background: #1e293b !important; }
-h1 { font-family: 'Georgia', serif; letter-spacing: -1px; }
-"""
-
-with gr.Blocks(
-    title="NeuroStruct — Receptor Binding Predictor",
-    theme=gr.themes.Base(
-        primary_hue="violet",
-        neutral_hue="slate",
-        font=gr.themes.GoogleFont("Inter"),
-    ),
-    css=CSS,
-) as demo:
-
-    gr.Markdown("""
-    # 🧠 NeuroStruct
-    ### Structure-Aware Binding Affinity Prediction for Neurotransmitter Receptors
-
-    Predict small-molecule binding affinity at **GABA-A** and **NMDA** receptor binding sites
-    using ESM-2 protein embeddings + Graph Attention Networks trained on structural data.
-
-    ---
-    """)
-
-    with gr.Row():
-        with gr.Column(scale=1):
-            gr.Markdown("### 📥 Input")
-
-            receptor_dropdown = gr.Dropdown(
-                choices=list(EXAMPLE_SEQUENCES.keys()) + ["Custom sequence"],
-                value=list(EXAMPLE_SEQUENCES.keys())[0],
-                label="Select receptor subunit",
-            )
-
-            sequence_input = gr.Textbox(
-                value=list(EXAMPLE_SEQUENCES.values())[0],
-                label="Protein sequence (single-letter AA codes)",
-                lines=6,
-                placeholder="Paste amino acid sequence here...",
-            )
-
-            pdb_viewer_id = gr.Textbox(
-                value="6HUP",
-                label="PDB ID for 3D viewer (e.g. 6HUP, 4PE6)",
-            )
-
-            submit_btn = gr.Button("🔬 Predict Binding Affinity", variant="primary", size="lg")
-
-            gr.Markdown("""
-            **About the model:**
-            - ESM-2 (650M) per-residue embeddings
-            - Graph Attention Network on Cα contact graph
-            - MD-derived RMSF node features
-            - Trained on GABA-A + NMDA BindingDB data
-            """)
-
-        with gr.Column(scale=2):
-            gr.Markdown("### 📊 Results")
-
-            with gr.Tabs():
-                with gr.Tab("Summary"):
-                    result_md = gr.Markdown("*Run a prediction to see results.*")
-
-                with gr.Tab("Attention Map"):
-                    attn_plot = gr.Plot(label="Residue Importance")
-
-                with gr.Tab("3D Structure"):
-                    viewer_html = gr.HTML(
-                        "<div style='color:#94a3b8; padding:20px;'>"
-                        "Run prediction to load structure viewer...</div>"
-                    )
-
-                with gr.Tab("JSON Report"):
-                    report_box = gr.Code(language="json", label="Full report")
-                    dl_btn = gr.Button("📥 Download Report", visible=False)
-
-    # ── Event handlers ────────────────────────────────────────────────
-
-    def update_sequence(receptor_name):
-        if receptor_name in EXAMPLE_SEQUENCES:
-            return EXAMPLE_SEQUENCES[receptor_name]
-        return ""
-
-    receptor_dropdown.change(
-        update_sequence,
-        inputs=receptor_dropdown,
-        outputs=sequence_input,
+    report = json.dumps(
+        {
+            "pdb_id": pdb_id.upper(),
+            "n_residues": int(data.num_nodes),
+            "predicted_dG_kcal_per_mol": pred_dG,
+            "top_residues": top,
+            "attention_sum": float(attn.sum()),
+        },
+        indent=2,
     )
 
-    submit_btn.click(
-        predict,
-        inputs=[sequence_input, receptor_dropdown, pdb_viewer_id],
-        outputs=[result_md, attn_plot, viewer_html, report_box, dl_btn],
-    )
+    return summary, report, str(pdb_path)
 
-    # ── Footer ────────────────────────────────────────────────────────
-    gr.Markdown("""
-    ---
-    **NeuroStruct** | Built with PyTorch, ESM-2, PyTorch Geometric, OpenMM, MDAnalysis
-    | [GitHub](https://github.com/yourusername/neurostruct)
-    """)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt")
+    args = parser.parse_args()
+
+    with gr.Blocks(title="NeuroStruct (Real Demo)") as demo:
+        gr.Markdown("# NeuroStruct — Real checkpoint demo (PDB → graph → GNN)")
+
+        with gr.Row():
+            pdb_id = gr.Textbox(value="6HUP", label="PDB ID (e.g., 6HUP)")
+            ckpt = gr.Textbox(value=args.checkpoint, label="Checkpoint path")
+
+        btn = gr.Button("Predict", variant="primary")
+        out_md = gr.Markdown()
+        out_json = gr.Code(language="json", label="Report")
+        out_path = gr.Textbox(label="Downloaded PDB path")
+
+        btn.click(predict, inputs=[pdb_id, ckpt], outputs=[out_md, out_json, out_path])
+
+    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
 
 
 if __name__ == "__main__":
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=7860,
-        share=False,
-        show_error=True,
-    )
+    main()
