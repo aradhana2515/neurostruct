@@ -16,7 +16,7 @@ import numpy as np
 import requests
 import torch
 import gradio as gr
-
+from torch_geometric.data import Data
 warnings.filterwarnings("ignore")
 
 # Allow imports from repo root
