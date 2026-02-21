@@ -39,7 +39,7 @@ def download_pdb(pdb_id: str, out_dir: Path) -> Path:
     return out_path
 
 
-def graph_from_pdb(pdb_path: Path) -> torch_geometric.data.Data:
+def graph_from_pdb(pdb_path: Path) -> Data:
     """
     Build a PyG Data graph from PDB:
       - binding site residues if ligand present (fallback: all residues) :contentReference[oaicite:9]{index=9}
