@@ -1,6 +1,8 @@
 name: neurostruct
+
 channels:
   - pytorch
+  - pyg
   - conda-forge
   - defaults
 
@@ -14,41 +16,37 @@ dependencies:
   - seaborn
   - jupyter
   - tqdm
+  - requests
+  - h5py
 
-  # PyTorch
+  # PyTorch (CPU). If you have GPU, remove cpuonly and add pytorch-cuda later.
   - pytorch>=2.0
   - torchvision
-  - cpuonly  # replace with cudatoolkit=11.8 if GPU available
+  - cpuonly
+
+  # PyTorch Geometric (use pyg channel)
+  - pyg
+  - pytorch-scatter
+  - pytorch-sparse
+  - pytorch-cluster
+  - pytorch-spline-conv
+  - torch-geometric
 
   # Structural biology
+  - biopython>=1.81
   - mdanalysis>=2.4
   - openmm>=8.0
   - pdbfixer
+  - biotite
 
-  # Visualization
-  - pymol-open-source  # or use conda-forge/pymol
+  # Visualization / demo
+  - gradio>=4.0
+  - py3Dmol
+
+  # Optional (can be heavy / finicky on some machines)
+  # - pymol-open-source
 
   - pip:
-    # PyTorch Geometric (graph neural networks)
-    - torch-geometric
-    - torch-scatter
-    - torch-sparse
-
-    # ESM protein language model
-    - fair-esm
-
-    # Bioinformatics
-    - biopython>=1.81
-    - biotite
-
-    # Data & experiment tracking
-    - wandb
-    - requests
-    - h5py
-
-    # Demo
-    - gradio>=4.0
-    - py3Dmol
-
-    # Chem
-    - rdkit-pypi
+      - fair-esm
+      - wandb
+      - rdkit-pypi
