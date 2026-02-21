@@ -285,6 +285,31 @@ def train(args):
     model.load_state_dict(ckpt["model_state"])
 
     test_metrics = evaluate(model, test_loader, device)
+    import time
+    import json
+    from pathlib import Path
+
+    # --- Save a reproducible run artifact folder ---
+    run_id = f"{'baseline_mlp' if args.baseline else 'gnn'}_{int(time.time())}"
+    run_dir = Path("results") / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save metrics + config
+    (run_dir / "test_metrics.json").write_text(json.dumps(test_metrics, indent=2))
+    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
+
+    # Save split sizes (quick sanity)
+    split_info = {
+        "train_n": len(train_data),
+        "val_n": len(val_data),
+        "test_n": len(test_data),
+    }
+    (run_dir / "splits.json").write_text(json.dumps(split_info, indent=2))
+
+    # Save which checkpoint corresponds to these metrics
+    (run_dir / "checkpoint_path.txt").write_text(str(best_ckpt_path) + "\n")
+
+    print(f"✅ Saved run artifacts to: {run_dir}")
     log.info(f"\n{'='*55}")
     log.info("TEST SET RESULTS")
     log.info(f"{'='*55}")
