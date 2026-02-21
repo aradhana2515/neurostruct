@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Data (large files — store with DVC or separately)
+data/raw/
+data/processed/
+data/trajectories/
+
+# Model checkpoints
+checkpoints/
+*.pt
+*.pth
+
+# Outputs
+outputs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# W&B
+wandb/
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
