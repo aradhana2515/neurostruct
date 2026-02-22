@@ -1,0 +1,17 @@
+{
+  "data_dir": "data/processed",
+  "out_dir": "checkpoints",
+  "hidden_dim": 256,
+  "num_layers": 4,
+  "heads": 4,
+  "dropout": 0.15,
+  "baseline": false,
+  "epochs": 100,
+  "batch_size": 4,
+  "lr": 0.001,
+  "weight_decay": 0.0001,
+  "grad_clip": 1.0,
+  "patience": 20,
+  "device": "cpu",
+  "no_wandb": true
+}
