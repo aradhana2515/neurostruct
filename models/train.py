@@ -36,7 +36,8 @@ from scipy.stats import pearsonr
 
 # Local imports
 import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from pathlib import Path as PathLib
+sys.path.insert(0, str(PathLib(__file__).parent.parent))
 from models.binding_gnn import BindingGNN, BaselineMLP
 
 logging.basicConfig(
