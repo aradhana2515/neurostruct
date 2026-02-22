@@ -39,7 +39,6 @@ from torch_geometric.nn import (
     global_mean_pool,
     global_add_pool,
 )
-from torch_geometric.utils import softmax as pyg_softmax
 from typing import Optional, Tuple, List
 
 
@@ -75,11 +74,10 @@ class ResidualGATLayer(nn.Module):
             heads=heads,
             dropout=dropout,
             edge_dim=edge_dim,
-            concat=True,       # concatenate heads → out_dim total
+            concat=True,
             share_weights=False,
         )
 
-        # Skip connection with projection if dims differ
         self.skip = (
             nn.Linear(in_dim, out_dim, bias=False)
             if in_dim != out_dim
@@ -105,7 +103,7 @@ class ResidualGATLayer(nn.Module):
 
         out = self.act(out)
         out = self.drop(out)
-        out = self.norm(out + self.skip(x))   # pre-norm residual
+        out = self.norm(out + self.skip(x))
 
         return (out, attn) if return_attention else out
 
@@ -114,7 +112,7 @@ class AttentionPooling(nn.Module):
     """
     Learnable attention pooling over nodes → single graph embedding.
     Score each node with a small MLP, softmax over graph, weighted sum.
-    More expressive than naive mean/max pooling.
+    Uses manual per-graph softmax for full PyG version compatibility.
     """
 
     def __init__(self, hidden_dim: int):
@@ -131,10 +129,16 @@ class AttentionPooling(nn.Module):
           pooled  : (B, hidden_dim) — one vector per graph
           weights : (N,)            — per-node attention scores
         """
-        gate_scores = self.gate(x)                         # (N, 1)
-        weights = pyg_softmax(gate_scores, batch, dim=0)   # (N, 1) softmax per graph
-        pooled = global_add_pool(weights * x, batch)       # (B, hidden_dim)
-        return pooled, weights.squeeze(-1)
+        gate_scores = self.gate(x).squeeze(-1)      # (N,)
+
+        # Manual per-graph softmax — compatible with all PyG versions
+        weights = torch.zeros_like(gate_scores)
+        for g in batch.unique():
+            mask = (batch == g)
+            weights[mask] = torch.softmax(gate_scores[mask], dim=0)
+
+        pooled = global_add_pool(weights.unsqueeze(-1) * x, batch)  # (B, hidden_dim)
+        return pooled, weights
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +181,7 @@ class BindingGNN(nn.Module):
             nn.GELU(),
         )
 
-        # Edge feature projection (distance → learnable embedding)
+        # Edge feature projection
         self.edge_proj = nn.Sequential(
             nn.Linear(edge_dim, 16),
             nn.GELU(),
@@ -197,7 +201,7 @@ class BindingGNN(nn.Module):
             for _ in range(num_layers)
         ])
 
-        # Stochastic depth (drop entire layers during training)
+        # Stochastic depth
         self.layer_drop_probs = [
             i * 0.05 / max(num_layers - 1, 1) for i in range(num_layers)
         ]
@@ -223,46 +227,28 @@ class BindingGNN(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, data: Data) -> Tensor:
-        """
-        Parameters
-        ----------
-        data : PyG Data (or Batch) with fields:
-               x, edge_index, edge_attr, batch
-
-        Returns
-        -------
-        Tensor (B,) — predicted ΔG in kcal/mol
-        """
-        x          = data.x                              # (N, node_dim)
-        edge_index = data.edge_index                     # (2, E)
-        edge_attr  = data.edge_attr                      # (E, 1)
+        x          = data.x
+        edge_index = data.edge_index
+        edge_attr  = data.edge_attr
         batch      = getattr(data, "batch",
                              torch.zeros(x.size(0), dtype=torch.long, device=x.device))
 
-        # Project inputs
-        x = self.input_proj(x)                           # (N, H)
-        e = self.edge_proj(edge_attr)                    # (E, 16)
+        x = self.input_proj(x)
+        e = self.edge_proj(edge_attr)
 
-        # GAT layers with stochastic depth
         for layer, drop_prob in zip(self.gat_layers, self.layer_drop_probs):
             if self.training and torch.rand(1).item() < drop_prob:
-                continue   # stochastic depth: skip this layer
+                continue
             x = layer(x, edge_index, edge_attr=e)
 
-        # Attention-weighted pooling → graph embedding
-        graph_emb, _ = self.pool(x, batch)               # (B, H)
-
-        # Regression
-        out = self.head(graph_emb).squeeze(-1)            # (B,)
+        graph_emb, _ = self.pool(x, batch)
+        out = self.head(graph_emb).squeeze(-1)
         return out
 
     def get_attention_weights(self, data: Data) -> Tensor:
         """
-        Run a forward pass and return per-residue importance scores.
-        These are the attention-pooling weights — higher = more important
-        for the binding affinity prediction.
-
-        Returns Tensor (N,) where N = number of residues
+        Returns per-residue importance scores (N,).
+        Higher = more important for binding affinity prediction.
         """
         self.eval()
         with torch.no_grad():
@@ -279,27 +265,25 @@ class BindingGNN(nn.Module):
 
             _, weights = self.pool(x, batch)
 
-        return weights   # (N,)
+        return weights  # (N,)
 
     def get_layer_attention(
         self, data: Data, layer_idx: int = -1
     ) -> Tuple[Tensor, Tensor]:
         """
         Extract raw GAT attention coefficients from a specific layer.
-        Useful for visualizing which residue–residue interactions the
-        model relies on (attention maps on the contact graph).
 
         Returns
         -------
-        edge_index : (2, E)
-        attn_weights : (E, heads)  — attention per edge per head
+        edge_index   : (2, E)
+        attn_weights : (E, heads)
         """
         if layer_idx == -1:
             layer_idx = self.num_layers - 1
 
         self.eval()
         with torch.no_grad():
-            x         = data.x
+            x          = data.x
             edge_index = data.edge_index
             edge_attr  = data.edge_attr
 
@@ -315,11 +299,11 @@ class BindingGNN(nn.Module):
                     )
                     break
 
-        return ei, alpha   # edge_index, (E, heads)
+        return ei, alpha
 
 
 # ---------------------------------------------------------------------------
-# Baseline: simple MLP on mean-pooled ESM embeddings
+# Baseline: simple MLP on mean-pooled features
 # ---------------------------------------------------------------------------
 
 class BaselineMLP(nn.Module):
@@ -344,7 +328,7 @@ class BaselineMLP(nn.Module):
     def forward(self, data: Data) -> Tensor:
         batch = getattr(data, "batch",
                         torch.zeros(data.x.size(0), dtype=torch.long))
-        pooled = global_mean_pool(data.x, batch)   # (B, node_dim)
+        pooled = global_mean_pool(data.x, batch)
         return self.net(pooled).squeeze(-1)
 
 
@@ -353,11 +337,8 @@ class BaselineMLP(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from torch_geometric.data import Data
-
     print("Running BindingGNN sanity check...")
 
-    # Fake a small graph: 30 residues, 120 edges
     N, E, F = 30, 120, 25
     data = Data(
         x=torch.randn(N, F),
@@ -371,8 +352,8 @@ if __name__ == "__main__":
     attn = model.get_attention_weights(data)
 
     print(f"  Predicted ΔG: {pred.item():.3f} kcal/mol")
-    print(f"  Attention weights shape: {attn.shape}")   # (30,)
-    print(f"  Attention sum: {attn.sum().item():.4f}")   # ≈ 1.0
+    print(f"  Attention weights shape: {attn.shape}")
+    print(f"  Attention sum: {attn.sum().item():.4f}")
     print(f"  Model params: {sum(p.numel() for p in model.parameters()):,}")
     print("  ✓ BindingGNN OK")
 
