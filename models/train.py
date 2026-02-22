@@ -15,6 +15,9 @@ Usage:
   python models/train.py --epochs 100 --lr 1e-3 --hidden_dim 256 --heads 4
   python models/train.py --baseline   # train MLP baseline for comparison
 """
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
 import math
@@ -35,9 +38,9 @@ from torch_geometric.loader import DataLoader
 from scipy.stats import pearsonr
 
 # Local imports
-import sys
-from pathlib import Path as PathLib
-sys.path.insert(0, str(PathLib(__file__).parent.parent))
+# import sys
+# from pathlib import Path as PathLib
+# sys.path.insert(0, str(PathLib(__file__).parent.parent))
 from models.binding_gnn import BindingGNN, BaselineMLP
 
 logging.basicConfig(
