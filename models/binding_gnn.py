@@ -123,20 +123,24 @@ class AttentionPooling(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-     def forward(self, x: Tensor, batch: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, x: Tensor, batch: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Returns:
           pooled  : (B, hidden_dim) — one vector per graph
           weights : (N,)            — per-node attention scores
         """
-        gate_scores = self.gate(x).squeeze(-1)      # (N,)
+        gate_scores = self.gate(x).squeeze(-1)  # (N,)
+
+        # Handle None batch (single graph inference)
         if batch is None:
             batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+
         # Manual per-graph softmax — compatible with all PyG versions
         weights = torch.zeros_like(gate_scores)
         for g in batch.unique():
             mask = (batch == g)
             weights[mask] = torch.softmax(gate_scores[mask], dim=0)
+
         pooled = global_add_pool(weights.unsqueeze(-1) * x, batch)  # (B, hidden_dim)
         return pooled, weights
 
